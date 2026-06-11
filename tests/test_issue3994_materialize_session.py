@@ -114,3 +114,67 @@ def test_materialize_rejects_messaging_cli_meta_without_readonly_flag():
     assert not mock_import.called, "must not import a messaging session"
     assert not MockSession.called, "must not build a writable messaging stub"
 
+
+def test_materialize_allows_cron_cli_session():
+    """A cron session (state.db source='cron') must be allowed through the
+    messaging denylist and materialized normally.
+
+    Background (issue #3975, maintainer verification ask): cron-job sessions
+    live in state.db but typically don't appear in ``get_cli_sessions()``, so
+    they rely on the materialize fallback.  The maintainer wanted explicit
+    confirmation that cron-origin sessions are not refused by the messaging /
+    claude_code / external_agent / gateway denylist — they should be
+    claimable since they're state.db-backed agent sessions.  This test pins
+    that contract: a cron-shaped cli_meta (source_tag='cron',
+    session_source='other') is materialized via ``import_cli_session`` like
+    any other non-messaging, non-readonly CLI session."""
+    import api.routes as routes
+
+    cli_meta = {
+        "read_only": False,
+        "title": "Scheduled run",
+        "model": "gpt-test",
+        "profile": "default",
+        "source_tag": "cron",
+        "session_source": "other",
+    }
+    imported = SimpleNamespace(
+        session_id="cron1", profile="default",
+        messages=[{"role": "user", "content": "scheduled task"}],
+    )
+    with patch("api.routes.get_session", side_effect=KeyError("cron1")), \
+         patch("api.routes._lookup_cli_session_metadata", return_value=cli_meta), \
+         patch("api.routes._is_messaging_session_record", return_value=False), \
+         patch("api.routes.get_cli_session_messages",
+               return_value=[{"role": "user", "content": "scheduled task"}]), \
+         patch("api.routes.title_from", return_value="Scheduled run"), \
+         patch("api.routes.import_cli_session", return_value=imported) as mock_import:
+        out = routes._get_or_materialize_session("cron1")
+    assert out is imported
+    assert mock_import.called, "cron session must be materialized via import_cli_session"
+    # cron is claimable: no PermissionError raised, no messaging rejection
+    assert getattr(out, "is_cli_session", None) is True
+    assert getattr(out, "source_tag", None) == "cron"
+
+
+def test_materialize_rejects_cron_with_explicit_readonly_flag():
+    """Cron + read_only=True must still be refused — explicit read_only wins
+    over source classification (mirrors the messaging + read_only contract
+    in ``_is_messaging_session_record``)."""
+    import api.routes as routes
+
+    cli_meta = {
+        "read_only": True,
+        "title": "Locked cron",
+        "model": "gpt-test",
+        "source_tag": "cron",
+        "session_source": "other",
+    }
+    with patch("api.routes.get_session", side_effect=KeyError("cron_ro")), \
+         patch("api.routes._lookup_cli_session_metadata", return_value=cli_meta), \
+         patch("api.routes._is_messaging_session_record", return_value=False), \
+         patch("api.routes.import_cli_session") as mock_import:
+        with pytest.raises(PermissionError):
+            routes._get_or_materialize_session("cron_ro")
+    assert not mock_import.called, "read-only cron must not be imported"
+

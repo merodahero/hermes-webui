@@ -12928,11 +12928,18 @@ def _handle_chat_start(handler, body, diag=None):
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
-        diag.stage("get_session") if diag else None
+        diag.stage("get_or_materialize_session") if diag else None
         try:
-            s = get_session(body["session_id"])
+            s = _get_or_materialize_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        except PermissionError as e:
+            # Foreign-origin session is read-only (messaging/Claude Code) or
+            # explicitly locked — refuse to claim it writeable.  Returns 403
+            # so the client can surface a "this session is read-only" UX
+            # instead of silently discarding the user's typed message.
+            # Closes the GET-vs-POST asymmetry noted in PR #3901.
+            return bad(handler, f"session is read-only in its foreign store; cannot be claimed writeable: {e}", 403)
         diag.stage("validate_profile") if diag else None
         requested_profile = str(body.get("profile") or "").strip()
         if requested_profile:

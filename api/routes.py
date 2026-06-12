@@ -1589,6 +1589,103 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _state_db_synthetic_cli_meta(sid: str) -> dict:
+    """Build a synthetic cli_meta dict from a state.db row, for sessions that
+    don't appear in ``get_cli_sessions()`` (cron jobs, TUI/Desktop past the
+    CLI cap, etc.) but DO have recoverable messages in state.db.
+
+    Returns an empty dict if the session isn't in state.db, or has no
+    recoverable messages.  The shape mirrors what ``_lookup_cli_session_metadata``
+    would return for a CLI session: ``title``, ``model``, ``source_tag``,
+    ``raw_source``, ``profile``, ``created_at``, ``updated_at``.
+
+    Note: state.db-only sessions are never messaging (state.db tracks the
+    actual agent surface that created the session — telegram/discord/etc.
+    messaging sessions appear in cli_meta via the existing lookup path).
+    So the messaging gate (``_is_messaging_session_record``) doesn't reject
+    these, and they flow through the regular ``import_cli_session`` path
+    with state.db messages as the source.
+
+    Closes the GET-vs-POST asymmetry in PR #3901 for cron jobs and TUI/Desktop
+    sessions past the CLI cap.  See also: issue #3975 (cron 404).
+    """
+    from api.models import (
+        _active_state_db_path,
+        get_state_db_session_messages,
+        get_state_db_session_summary,
+    )
+    import sqlite3
+    if not sid:
+        return {}
+    try:
+        db_path = _active_state_db_path()
+    except Exception:
+        return {}
+    if not db_path or not db_path.exists():
+        return {}
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {str(row[1]) for row in cur.fetchall()}
+            if 'id' not in cols:
+                return {}
+            cur.execute(
+                "SELECT id, title, model, source, started_at, ended_at, "
+                "profile, workspace, last_activity "
+                "FROM sessions WHERE id = ? LIMIT 1",
+                (str(sid),),
+            )
+            row = cur.fetchone()
+    except Exception:
+        return {}
+    if row is None:
+        return {}
+    source = (row['source'] or '').strip().lower() if row['source'] else ''
+    # Defensive: state.db sessions whose source IS a known messaging source
+    # should still flow through the existing messaging-rejection gate, not
+    # through this state.db fallback.  In practice, the messaging path is
+    # #3994's surface — state.db is for agent surfaces like cron/tui/cli.
+    if source in ('telegram', 'discord', 'whatsapp', 'homeassistant', 'gateway'):
+        return {}
+    summary = get_state_db_session_summary(sid) or {}
+    if not (summary.get('message_count') or 0):
+        # No recoverable messages: refuse rather than build a stub.
+        return {}
+    started_at = row['started_at'] if 'started_at' in cols else None
+    ended_at = row['ended_at'] if 'ended_at' in cols else None
+    last_activity = row['last_activity'] if 'last_activity' in cols else None
+    return {
+        'title': row['title'] or None,
+        'model': row['model'] or None,
+        'source_tag': source or 'agent',
+        'raw_source': source or 'agent',
+        'session_source': source or 'agent',
+        'profile': row['profile'] if 'profile' in cols else None,
+        'workspace': row['workspace'] if 'workspace' in cols else None,
+        'created_at': float(started_at) if started_at else None,
+        'updated_at': float(ended_at or last_activity or started_at) if (ended_at or last_activity or started_at) else None,
+        # Marker: this cli_meta was synthesized from state.db, not from
+        # get_cli_sessions.  The materialize path uses this to choose the
+        # right messages source.
+        '_state_db_synthesized': True,
+    }
+
+
+def _state_db_synthetic_messages(sid: str) -> list:
+    """Return the recoverable messages for a state.db-only session.
+
+    Used by ``_get_or_materialize_session`` when the cli_meta was synthesized
+    from state.db (rather than from ``get_cli_sessions()``).  The CLI
+    messages path doesn't apply — those messages live on disk in profile
+    dirs, not in state.db.  Wraps ``get_state_db_session_messages`` so the
+    caller doesn't have to know about the difference.
+    """
+    from api.models import get_state_db_session_messages
+    return get_state_db_session_messages(sid) or []
+
+
 def _get_or_materialize_session(sid: str):
     """Get a session, materializing from CLI/agent metadata if not in WebUI store.
 
@@ -1615,7 +1712,18 @@ def _get_or_materialize_session(sid: str):
     # Fallback: try to materialize from CLI/agent session metadata
     cli_meta = _lookup_cli_session_metadata(sid)
     if not cli_meta:
-        raise KeyError(sid)
+        # State.db fallback: cron jobs, TUI/Desktop sessions past the CLI cap
+        # (CLI_VISIBLE_SESSION_LIMIT), and any other agent surface that doesn't
+        # appear in get_cli_sessions() but does have recoverable messages in
+        # state.db.  This is the actual user-pain path for the 171-message TUI
+        # session in PR #3901 and the cron 404 in #3975 — both root-cause the
+        # same way: state.db has the session, the WebUI sidebar already shows
+        # it via the read-only stub, but POST /api/chat/start 404s because no
+        # cli_meta exists to drive the import path.  See state.db fallback in
+        # PR #3901's `_get_or_materialize_session`.
+        cli_meta = _state_db_synthetic_cli_meta(sid)
+        if not cli_meta:
+            raise KeyError(sid)
 
     # Read-only guard: messaging sessions and Claude Code imports cannot be
     # mutated. Reject BOTH an explicit read_only flag AND any messaging-source
@@ -1653,7 +1761,13 @@ def _get_or_materialize_session(sid: str):
         s.save(touch_updated_at=False)
     else:
         # Regular CLI/agent sessions: import full message history
-        msgs = get_cli_session_messages(sid)
+        # When cli_meta was synthesized from state.db (cron / TUI past the CLI
+        # cap), pull messages from state.db instead of CLI files.  See
+        # PR #3901's state.db fallback for the user-pain rationale.
+        if cli_meta.get("_state_db_synthesized"):
+            msgs = _state_db_synthetic_messages(sid)
+        else:
+            msgs = get_cli_session_messages(sid)
         if not msgs:
             raise KeyError(sid)
         s = import_cli_session(
